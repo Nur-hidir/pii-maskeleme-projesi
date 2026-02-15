@@ -1,12 +1,33 @@
+import streamlit as st
 import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 
+# ----------------------------
+# 1. AYARLAR (STREAMLIT İÇİN GEREKLİ)
+# ----------------------------
+st.set_page_config(page_title="PII Maskeleme", layout="wide")
 
+# CSS ile Butonu Yeşil Yapma
+st.markdown("""
+    <style>
+    div.stButton > button:first-child {
+        background-color: #28a745;
+        color: white;
+        font-size: 18px;
+        padding: 10px 24px;
+        border: none;
+    }
+    div.stButton > button:first-child:hover {
+        background-color: #218838;
+        color: white;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 # ----------------------------
-# Regex patterns
+# 2. SENİN BELİRLEDİĞİN REGEX KURALLARI (AYNEN KORUNDU)
 # ----------------------------
 REGEX_PATTERNS = {
     "EMAIL": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
@@ -47,12 +68,16 @@ class BERTNER:
             "tr": "savasy/bert-base-turkish-ner-cased"
         }
         self.pipelines = {}
-        for lang, model_name in self.models.items():
+        
+        # STREAMLIT İÇİN CACHE EKLENDİ (Performans için şart, mantığı değiştirmez)
+        @st.cache_resource
+        def load_pipeline(model_name):
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             model = AutoModelForTokenClassification.from_pretrained(model_name)
-            self.pipelines[lang] = pipeline(
-                "ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple"
-            )
+            return pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
+
+        for lang, model_name in self.models.items():
+            self.pipelines[lang] = load_pipeline(model_name)
 
     def predict(self, text: str, lang: str) -> List[Annotation]:
         ner_results = self.pipelines[lang](text)
@@ -84,7 +109,7 @@ def find_regex_candidates(text: str) -> List[Annotation]:
     return res
 
 # ----------------------------
-# Merge Entities
+# Merge Entities (SENİN YAZDIĞIN KORUMA MANTIĞI)
 # ----------------------------
 def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[Annotation]:
     # EMAIL'leri kesin korumak için özel işlem
@@ -139,7 +164,7 @@ def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[
     return merged
 
 # ----------------------------
-# Contextual Scoring (DÜZELTİLDİ - EXAMPLE.COM SİLİNDİ)
+# Contextual Scoring (SENİN KODUN)
 # ----------------------------
 def contextual_scoring(entity: Annotation, text: str) -> Dict[str, Any]:
     res = {"level": None, "action": None, "reason": []}
@@ -194,7 +219,7 @@ class PolicyManager:
         return "MASK","default_mask"
 
 # ----------------------------
-# Masking Logic
+# Masking Logic (SENİN PARÇALI MASKELEME MANTIĞIN)
 # ----------------------------
 DEFAULT_EMAIL_MASK = "***@***.com"
 DEFAULT_PHONE_MASK = "XXXXXXXXXX"
@@ -274,46 +299,44 @@ def analyze_text(text:str, lang:str="en") -> Tuple[str,str]:
 
 
 # ============================================================
-#               IPYWIDGETS UI
+#       3. STREAMLIT ARAYÜZÜ (BURASI DEĞİŞTİ, MANTIK AYNI)
 # ============================================================
-import ipywidgets as widgets
-from IPython.display import display
 
-text_input = widgets.Textarea(
-    value='',
-    placeholder='Metni buraya yazın...',
-    description='Metin:',
-    layout=widgets.Layout(width='95%', height='150px')
-)
+st.title("PII Maskeleme") 
 
-lang_select = widgets.Dropdown(
-    options=[("English","en"),("Türkçe","tr")],
-    value="en",
-    description="Dil:"
-)
+with st.sidebar:
+    st.header("Ayarlar")
+    lang_choice = st.selectbox(
+        "Dil Seçiniz",
+        options=["en", "tr"],
+        format_func=lambda x: "Türkçe (tr)" if x == "tr" else "English (en)"
+    )
 
-run_btn = widgets.Button(
-    description="Analiz Et",
-    button_style="success"
-)
+st.write("Aşağıdaki kutuya metninizi girin ve analiz butonuna basın.")
 
-output = widgets.Output(layout={'border': '1px solid black', 'padding': '10px'})
+# Streamlit Text Area (Senin widgets.Textarea yerine)
+text_input = st.text_area("Sadece metin girin", height=150)
 
-display(widgets.VBox([text_input, lang_select, run_btn, output]))
-
-def on_run_clicked(b):
-    output.clear_output()
-    with output:
-        text = text_input.value.strip()
-        if not text:
-            print("⚠ Lütfen metin girin.")
-            return
-
-        table, masked = analyze_text(text, lang_select.value)
-
-        print("📑 Özet Tablosu:\n")
-        print(table)
-        print("\n📋 Maskelenmiş Metin:\n")
-        print(masked)
-
-run_btn.on_click(on_run_clicked)
+# Streamlit Buton (Senin widgets.Button yerine)
+if st.button("Analiz Et"):
+    if not text_input.strip():
+        st.warning("Lütfen boş bırakmayınız.")
+    else:
+        with st.spinner("Analiz yapılıyor..."):
+            try:
+                # Senin fonksiyonunu çağırıyoruz
+                table_result, masked_result = analyze_text(text_input, lang_choice)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("Orijinal Metin")
+                    st.info(text_input)
+                with col2:
+                    st.subheader("Maskelenmiş Metin")
+                    st.success(masked_result)
+                
+                st.subheader("Analiz Tablosu")
+                st.text(table_result)
+                
+            except Exception as e:
+                st.error(f"Hata: {e}")
