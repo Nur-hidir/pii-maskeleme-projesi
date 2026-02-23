@@ -1,12 +1,33 @@
+import streamlit as st
 import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 
+# ----------------------------
+# 1. AYARLAR (SİTE İÇİN GEREKLİ)
+# ----------------------------
+st.set_page_config(page_title="PII Maskeleme", layout="wide")
 
+# Yeşil Buton Tasarımı
+st.markdown("""
+    <style>
+    div.stButton > button:first-child {
+        background-color: #28a745;
+        color: white;
+        border: none;
+        padding: 10px 24px;
+        font-size: 16px;
+    }
+    div.stButton > button:first-child:hover {
+        background-color: #218838;
+        color: white;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 # ----------------------------
-# Regex patterns
+# 2. SENİN MANTIK KODLARIN (HİÇ DEĞİŞTİRİLMEDİ)
 # ----------------------------
 REGEX_PATTERNS = {
     "EMAIL": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
@@ -18,14 +39,8 @@ REGEX_PATTERNS = {
     "ID": r"\b(?:ID|id|Id)[\s:.-]?[A-Za-z0-9]{3,}\b|\b[A-Z]{2,}\d{3,}\b|\b\d{3,}[A-Z]{2,}\b"
 }
 
-# ----------------------------
-# Public Figures List
-# ----------------------------
 PUBLIC_FIGURES = ["Elon Musk", "Barack Obama", "Angela Merkel"]
 
-# ----------------------------
-# Dataclass
-# ----------------------------
 @dataclass
 class Annotation:
     type: str
@@ -37,9 +52,6 @@ class Annotation:
     action: str = None
     reason: List[str] = field(default_factory=list)
 
-# ----------------------------
-# BERT NER Pipeline
-# ----------------------------
 class BERTNER:
     def __init__(self):
         self.models = {
@@ -47,12 +59,16 @@ class BERTNER:
             "tr": "savasy/bert-base-turkish-ner-cased"
         }
         self.pipelines = {}
-        for lang, model_name in self.models.items():
+        
+        # Site hızlansın diye önbellek (cache) ekledik, mantık aynı.
+        @st.cache_resource
+        def load_pipeline(model_name):
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             model = AutoModelForTokenClassification.from_pretrained(model_name)
-            self.pipelines[lang] = pipeline(
-                "ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple"
-            )
+            return pipeline("ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
+
+        for lang, model_name in self.models.items():
+            self.pipelines[lang] = load_pipeline(model_name)
 
     def predict(self, text: str, lang: str) -> List[Annotation]:
         ner_results = self.pipelines[lang](text)
@@ -67,9 +83,6 @@ class BERTNER:
             ))
         return anns
 
-# ----------------------------
-# Regex detection
-# ----------------------------
 def find_regex_candidates(text: str) -> List[Annotation]:
     res = []
     for label, pattern in REGEX_PATTERNS.items():
@@ -83,18 +96,12 @@ def find_regex_candidates(text: str) -> List[Annotation]:
             ))
     return res
 
-# ----------------------------
-# Merge Entities
-# ----------------------------
 def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[Annotation]:
-    # EMAIL'leri kesin korumak için özel işlem
     emails = [e for e in regex_es if e.type == "EMAIL"]
     ids = [e for e in regex_es if e.type == "ID"]
     
-    # Önce email ve ID'lerin span'lerini belirle
     protected_spans = [(e.start, e.end) for e in emails + ids]
     
-    # ML entitylerini filtrele: email/id span'leriyle çakışan ML entityleri çıkar
     filtered_ml = []
     for ml_e in ml_es:
         overlap = False
@@ -105,10 +112,8 @@ def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[
         if not overlap:
             filtered_ml.append(ml_e)
     
-    # Diğer regex entityleri
     other_regex = [e for e in regex_es if e.type not in ("EMAIL", "ID")]
     
-    # Tüm entityleri birleştir: EMAIL ve ID'ler önce
     all_e = emails + ids + other_regex + filtered_ml
     all_e.sort(key=lambda x: (x.start, -(x.end - x.start)))
 
@@ -119,12 +124,9 @@ def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[
             continue
 
         last = merged[-1]
-        # Overlap kontrolü
         if e.start < last.end:
-            # Eğer son eklenen EMAIL veya ID ise, kesinlikle koru
             if last.type in ("EMAIL", "ID"):
                 continue
-            # Eğer yeni gelen EMAIL veya ID ise, kesinlikle tercih et
             elif e.type in ("EMAIL", "ID"):
                 merged[-1] = e
             else:
@@ -138,9 +140,6 @@ def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[
             merged.append(e)
     return merged
 
-# ----------------------------
-# Contextual Scoring (ORG MASKELEME KALDIRILDI)
-# ----------------------------
 def contextual_scoring(entity: Annotation, text: str) -> Dict[str, Any]:
     res = {"level": None, "action": None, "reason": []}
     etype = entity.type.upper()
@@ -183,9 +182,6 @@ def contextual_scoring(entity: Annotation, text: str) -> Dict[str, Any]:
     res["reason"].append("default")
     return res
 
-# ----------------------------
-# Policy Manager
-# ----------------------------
 class PolicyManager:
     def __init__(self, jurisdiction="gdpr"):
         self.jurisdiction = jurisdiction.lower()
@@ -196,9 +192,6 @@ class PolicyManager:
             if annotation.level in (1,2): return "MASK","gdpr_mask"
         return "MASK","default_mask"
 
-# ----------------------------
-# Masking Logic
-# ----------------------------
 DEFAULT_EMAIL_MASK = "***@***.com"
 DEFAULT_PHONE_MASK = "XXXXXXXXXX"
 DEFAULT_DATE_MASK = "XX/XX/XXXX"
@@ -241,9 +234,6 @@ def apply_masking(text:str, annotations:List[Annotation]) -> str:
         masked = masked[:s] + mask + masked[e:]
     return masked
 
-# ----------------------------
-# Summary Table
-# ----------------------------
 def summary_table(annotations:List[Annotation]) -> str:
     lines = ["Value | Type | Level | Action | Reason"]
     for a in annotations:
@@ -251,9 +241,6 @@ def summary_table(annotations:List[Annotation]) -> str:
         lines.append(f"{a.value} | {a.type} | {a.level} | {a.action} | {reason_str}")
     return "\n".join(lines)
 
-# ----------------------------
-# Main Function
-# ----------------------------
 def analyze_text(text:str, lang:str="en") -> Tuple[str,str]:
     bert_ner = BERTNER()
     regex_candidates = find_regex_candidates(text)
@@ -275,48 +262,41 @@ def analyze_text(text:str, lang:str="en") -> Tuple[str,str]:
     table = summary_table(annotations)
     return table, masked_text
 
+# ----------------------------
+# 3. STREAMLIT ARAYÜZÜ (IPYWIDGETS YERİNE BURASI EKLENDİ)
+# ----------------------------
 
-# ============================================================
-#               IPYWIDGETS UI
-# ============================================================
-import ipywidgets as widgets
-from IPython.display import display
+st.title("PII Maskeleme Sistemi")
 
-text_input = widgets.Textarea(
-    value='',
-    placeholder='Metni buraya yazın...',
-    description='Metin:',
-    layout=widgets.Layout(width='95%', height='150px')
-)
+with st.sidebar:
+    st.header("Ayarlar")
+    # Colab'daki dropdown yerine bu kullanılır
+    lang_select = st.selectbox(
+        "Dil Seçiniz:",
+        options=["en", "tr"],
+        format_func=lambda x: "Türkçe" if x == "tr" else "English"
+    )
 
-lang_select = widgets.Dropdown(
-    options=[("English","en"),("Türkçe","tr")],
-    value="en",
-    description="Dil:"
-)
+# Colab'daki textarea yerine bu kullanılır
+text_input = st.text_area("Metni buraya girin:", height=150)
 
-run_btn = widgets.Button(
-    description="Analiz Et",
-    button_style="success"
-)
-
-output = widgets.Output(layout={'border': '1px solid black', 'padding': '10px'})
-
-display(widgets.VBox([text_input, lang_select, run_btn, output]))
-
-def on_run_clicked(b):
-    output.clear_output()
-    with output:
-        text = text_input.value.strip()
-        if not text:
-            print("⚠ Lütfen metin girin.")
-            return
-
-        table, masked = analyze_text(text, lang_select.value)
-
-        print("📑 Özet Tablosu:\n")
-        print(table)
-        print("\n📋 Maskelenmiş Metin:\n")
-        print(masked)
-
-run_btn.on_click(on_run_clicked)
+# Colab'daki run_btn yerine bu kullanılır
+if st.button("Analiz Et"):
+    if not text_input.strip():
+        st.warning("Lütfen bir metin girin.")
+    else:
+        with st.spinner("Analiz yapılıyor..."):
+            # Senin fonksiyonunu çağırıyoruz
+            table_result, masked_result = analyze_text(text_input, lang_select)
+            
+            # Sonuçları gösteriyoruz
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Orijinal")
+                st.info(text_input)
+            with c2:
+                st.subheader("Maskelenmiş")
+                st.success(masked_result)
+            
+            st.subheader("Özet Tablo")
+            st.text(table_result)
