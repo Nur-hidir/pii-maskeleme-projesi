@@ -1,9 +1,29 @@
+import streamlit as st
 import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 
+# ----------------------------
+# STREAMLIT AYARLARI
+# ----------------------------
+st.set_page_config(page_title="PII Maskeleme", layout="wide")
 
+st.markdown("""
+    <style>
+    div.stButton > button:first-child {
+        background-color: #28a745;
+        color: white;
+        border: none;
+        padding: 10px 24px;
+        font-size: 16px;
+    }
+    div.stButton > button:first-child:hover {
+        background-color: #218838;
+        color: white;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 # ----------------------------
 # Regex patterns
@@ -67,6 +87,11 @@ class BERTNER:
             ))
         return anns
 
+# Streamlit'in her butona basışta modeli baştan indirmesini engellemek için cache kullanıyoruz.
+@st.cache_resource
+def get_bert_ner():
+    return BERTNER()
+
 # ----------------------------
 # Regex detection
 # ----------------------------
@@ -87,14 +112,11 @@ def find_regex_candidates(text: str) -> List[Annotation]:
 # Merge Entities
 # ----------------------------
 def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[Annotation]:
-    # EMAIL'leri kesin korumak için özel işlem
     emails = [e for e in regex_es if e.type == "EMAIL"]
     ids = [e for e in regex_es if e.type == "ID"]
     
-    # Önce email ve ID'lerin span'lerini belirle
     protected_spans = [(e.start, e.end) for e in emails + ids]
     
-    # ML entitylerini filtrele: email/id span'leriyle çakışan ML entityleri çıkar
     filtered_ml = []
     for ml_e in ml_es:
         overlap = False
@@ -105,10 +127,8 @@ def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[
         if not overlap:
             filtered_ml.append(ml_e)
     
-    # Diğer regex entityleri
     other_regex = [e for e in regex_es if e.type not in ("EMAIL", "ID")]
     
-    # Tüm entityleri birleştir: EMAIL ve ID'ler önce
     all_e = emails + ids + other_regex + filtered_ml
     all_e.sort(key=lambda x: (x.start, -(x.end - x.start)))
 
@@ -119,12 +139,9 @@ def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[
             continue
 
         last = merged[-1]
-        # Overlap kontrolü
         if e.start < last.end:
-            # Eğer son eklenen EMAIL veya ID ise, kesinlikle koru
             if last.type in ("EMAIL", "ID"):
                 continue
-            # Eğer yeni gelen EMAIL veya ID ise, kesinlikle tercih et
             elif e.type in ("EMAIL", "ID"):
                 merged[-1] = e
             else:
@@ -184,7 +201,7 @@ def contextual_scoring(entity: Annotation, text: str) -> Dict[str, Any]:
     return res
 
 # ----------------------------
-# Policy Manager (KVKK KODDA MEVCUT)
+# Policy Manager
 # ----------------------------
 class PolicyManager:
     def __init__(self, jurisdiction="gdpr"):
@@ -258,12 +275,14 @@ def summary_table(annotations:List[Annotation]) -> str:
 # Main Function
 # ----------------------------
 def analyze_text(text:str, lang:str="en") -> Tuple[str,str]:
-    bert_ner = BERTNER()
+    bert_ner = get_bert_ner()
     regex_candidates = find_regex_candidates(text)
     ml_entities = bert_ner.predict(text, lang)
     merged = merge_entities(regex_candidates, ml_entities)
 
-    policy_mgr = PolicyManager("gdpr")
+    # DİNAMİK YASA SEÇİMİ: Türkçe ise KVKK, İngilizce ise GDPR çalışsın
+    jurisdiction = "kvkk" if lang == "tr" else "gdpr"
+    policy_mgr = PolicyManager(jurisdiction)
 
     annotations = []
     for e in merged:
@@ -280,46 +299,37 @@ def analyze_text(text:str, lang:str="en") -> Tuple[str,str]:
 
 
 # ============================================================
-#               IPYWIDGETS UI
+#               STREAMLIT ARAYÜZÜ
 # ============================================================
-import ipywidgets as widgets
-from IPython.display import display
 
-text_input = widgets.Textarea(
-    value='',
-    placeholder='Metni buraya yazın...',
-    description='Metin:',
-    layout=widgets.Layout(width='95%', height='150px')
-)
+st.title("Yapay Zeka Destekli PII Maskeleme")
 
-lang_select = widgets.Dropdown(
-    options=[("English","en"),("Türkçe","tr")],
-    value="en",
-    description="Dil:"
-)
+with st.sidebar:
+    st.header("Sistem Ayarları")
+    lang_select = st.selectbox(
+        "Dil Seçiniz:",
+        options=["en", "tr"],
+        format_func=lambda x: "Türkçe (KVKK)" if x == "tr" else "English (GDPR)"
+    )
 
-run_btn = widgets.Button(
-    description="Analiz Et",
-    button_style="success"
-)
+text_input = st.text_area("Analiz edilecek metni buraya yapıştırın:", height=150)
 
-output = widgets.Output(layout={'border': '1px solid black', 'padding': '10px'})
+if st.button("Analiz Et"):
+    if not text_input.strip():
+        st.warning("⚠ Lütfen metin girin.")
+    else:
+        with st.spinner("Modeller çalışıyor, lütfen bekleyin..."):
+            table, masked = analyze_text(text_input, lang_select)
 
-display(widgets.VBox([text_input, lang_select, run_btn, output]))
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Orijinal Metin")
+                st.info(text_input)
+                
+            with col2:
+                st.subheader("Maskelenmiş Metin")
+                st.success(masked)
 
-def on_run_clicked(b):
-    output.clear_output()
-    with output:
-        text = text_input.value.strip()
-        if not text:
-            print("⚠ Lütfen metin girin.")
-            return
-
-        table, masked = analyze_text(text, lang_select.value)
-
-        print("📑 Özet Tablosu:\n")
-        print(table)
-        print("\n📋 Maskelenmiş Metin:\n")
-        print(masked)
-
-run_btn.on_click(on_run_clicked)
+            st.subheader("📑 Özet Tablosu")
+            st.text(table)
