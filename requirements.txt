@@ -1,10 +1,7 @@
 streamlit
+wikipedia-api
 transformers
-torch
 pdfplumber
 python-docx
 reportlab
-wikipediaapi
- 
- 
- 
+tf-keras
