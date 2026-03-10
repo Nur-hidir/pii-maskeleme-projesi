@@ -439,22 +439,21 @@ if uploaded_file:
 
     st.text_area("", masked_text, height=250)
 
-    st.subheader("Summary")
+    # İNDİRME SEÇENEKLERİ (DROPDOWN EKLENDİ)
+    st.subheader("Download / İndir")
+    export_format = st.selectbox("Format Seçin", ["PDF", "DOCX"])
 
-    st.text_area("", summary, height=250)
-
-    pdf_path = export_masked_pdf(masked_text)
-
-    docx_path = export_masked_docx(masked_text)
-
-    st.download_button(
-        "Download Masked PDF",
-        data=open(pdf_path, "rb").read(),
-        file_name="masked_output.pdf"
-    )
-
-    st.download_button(
-        "Download Masked DOCX",
-        data=open(docx_path, "rb").read(),
-        file_name="masked_output.docx"
-    )
+    if export_format == "PDF":
+        pdf_path = export_masked_pdf(masked_text)
+        st.download_button(
+            label="Download Masked PDF",
+            data=open(pdf_path, "rb").read(),
+            file_name="masked_output.pdf"
+        )
+    elif export_format == "DOCX":
+        docx_path = export_masked_docx(masked_text)
+        st.download_button(
+            label="Download Masked DOCX",
+            data=open(docx_path, "rb").read(),
+            file_name="masked_output.docx"
+        )
