@@ -60,7 +60,7 @@ def tckn_check(tckn: str) -> bool:
 
 
 # ============================================================
-# REGEX PATTERNS (GÜNCELLENDİ)
+# REGEX PATTERNS 
 # ============================================================
 
 REGEX_PATTERNS = {
@@ -82,7 +82,7 @@ def is_public_email(email: str) -> bool:
 
 
 # ============================================================
-# FONT (UNICODE SUPPORT) - TÜRKÇE KARAKTER SORUNU İÇİN
+# FONT (UNICODE SUPPORT) 
 # ============================================================
 
 def register_fonts():
@@ -120,7 +120,6 @@ DEFAULT_FONT = register_fonts()
 # ============================================================
 
 def read_pdf_smart(file_bytes: bytes) -> str:
-    """Önce dijital metni okur, metin yoksa OCR (Tesseract) çalıştırır."""
     text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -141,7 +140,6 @@ def read_docx(file_bytes: bytes) -> str:
     return "\n".join(p.text for p in doc.paragraphs)
 
 def read_image(file_bytes: bytes) -> str:
-    """Yüklenen görseli OCR ile okuyup metne çevirir."""
     with st.status("Görsel OCR ile analiz ediliyor..."):
         img = Image.open(io.BytesIO(file_bytes))
         ocr_text = pytesseract.image_to_string(img, lang='tur+eng')
@@ -166,31 +164,26 @@ class Annotation:
 
 
 # ============================================================
-# BERT NER & WIKIPEDIA
+# MEMORY OPTIMIZED BERT NER (RAM DOSTU YAPI)
 # ============================================================
 
-class BERTNER:
-    MODELS = {
-        "en": "dbmdz/bert-large-cased-finetuned-conll03-english",
+@st.cache_resource
+def load_ner_model(lang: str):
+    """Yapay zeka modelini RAM'i doldurmamak için sadece gerektiğinde yükler."""
+    models = {
+        "en": "dslim/bert-base-NER", # Large model yerine RAM dostu base model kullanıldı
         "tr": "savasy/bert-base-turkish-ner-cased"
     }
-    _pipes = {}
+    model_name = models[lang]
+    return pipeline("ner", model=model_name, tokenizer=model_name, aggregation_strategy="max")
 
-    def __init__(self):
-        for lang, model in self.MODELS.items():
-            if lang not in self._pipes:
-                self._pipes[lang] = pipeline(
-                    "ner", model=model, tokenizer=model, aggregation_strategy="max"
-                )
-
-    def predict(self, text: str, lang: str):
-        return [
-            Annotation(type=e["entity_group"], value=e["word"], 
-                       start=e["start"], end=e["end"], source="bert")
-            for e in self._pipes[lang](text)
-        ]
-
-bert_ner = BERTNER()
+def predict_ner(text: str, lang: str):
+    pipe = load_ner_model(lang)
+    return [
+        Annotation(type=e["entity_group"], value=e["word"], 
+                   start=e["start"], end=e["end"], source="bert")
+        for e in pipe(text)
+    ]
 
 wiki_en = wikipediaapi.Wikipedia(user_agent="privacy_tool", language="en")
 wiki_tr = wikipediaapi.Wikipedia(user_agent="privacy_tool", language="tr")
@@ -314,7 +307,7 @@ def export_masked_docx(text):
 
 def analyze_text(text, lang):
     regex_entities = find_regex_entities(text)
-    bert_entities = bert_ner.predict(text, lang)
+    bert_entities = predict_ner(text, lang) # Güncellenen fonksiyon kullanıldı
     merged = merge_entities(regex_entities, bert_entities)
 
     for e in merged:
@@ -335,7 +328,6 @@ st.set_page_config(page_title="PII Masking Tool", layout="wide")
 
 st.title("PII Masking & NER Tool")
 
-# GÜNCELLEME: Uploader artık resim dosyalarını da kabul ediyor
 uploaded_file = st.file_uploader("Upload PDF, DOCX or Image", type=["pdf", "docx", "png", "jpg", "jpeg"])
 
 lang = st.selectbox("Language", ["en", "tr"])
@@ -343,13 +335,12 @@ lang = st.selectbox("Language", ["en", "tr"])
 if uploaded_file:
     file_bytes = uploaded_file.read()
 
-    # Dosya türüne göre doğru okuyucuyu seçme
     if uploaded_file.type == "application/pdf":
         raw_text = read_pdf_smart(file_bytes)
     elif uploaded_file.name.endswith(".docx") or "wordprocessingml" in uploaded_file.type:
         raw_text = read_docx(file_bytes)
     elif uploaded_file.type in ["image/png", "image/jpeg", "image/jpg"]:
-        raw_text = read_image(file_bytes) # Yeni eklenen görsel okuyucu
+        raw_text = read_image(file_bytes)
     else:
         st.error("Desteklenmeyen dosya formatı!")
         raw_text = ""
