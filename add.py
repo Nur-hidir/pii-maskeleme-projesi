@@ -54,15 +54,37 @@ def is_public_email(email: str) -> bool:
 
 
 # ============================================================
-# FONT (UNICODE SUPPORT)
+# FONT (UNICODE SUPPORT) - TÜRKÇE KARAKTER SORUNU İÇİN GÜNCELLENDİ
 # ============================================================
 
 def register_fonts():
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    import urllib.request
+    font_path = "Roboto-Regular.ttf"
+    
+    # 1. Klasörde font yoksa internetten Türkçe destekli Roboto fontunu otomatik indir
+    if not os.path.exists(font_path):
+        try:
+            url = "https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf"
+            urllib.request.urlretrieve(url, font_path)
+        except Exception:
+            pass
+            
     if os.path.exists(font_path):
-        pdfmetrics.registerFont(TTFont("DejaVuSans", font_path))
-        return "DejaVuSans"
-    return "Helvetica"
+        pdfmetrics.registerFont(TTFont("Roboto", font_path))
+        return "Roboto"
+
+    # 2. İndirme başarısız olursa yerel sistemlerdeki (Windows/Mac/Linux) Türkçe fontları ara
+    local_fonts = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", # Linux
+        "C:\\Windows\\Fonts\\arial.ttf",                   # Windows
+        "/Library/Fonts/Arial.ttf"                         # Mac
+    ]
+    for path in local_fonts:
+        if os.path.exists(path):
+            pdfmetrics.registerFont(TTFont("LocalUTF8", path))
+            return "LocalUTF8"
+            
+    return "Helvetica" # Son çare
 
 
 DEFAULT_FONT = register_fonts()
