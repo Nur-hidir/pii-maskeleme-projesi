@@ -411,49 +411,82 @@ def analyze_text(text, lang):
 # STREAMLIT UI
 # ============================================================
 
-st.set_page_config(page_title="PII Masking Tool", layout="wide")
+# ============================================================
+# STREAMLIT UI (GELİŞTİRİLMİŞ ŞIK ARAYÜZ)
+# ============================================================
 
-st.title("PII Masking & NER Tool")
+st.set_page_config(page_title="PII Masking Tool", layout="wide", page_icon="🕵️‍♂️")
 
-uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
+# Üst Başlık ve İnce Açıklama
+st.title("🕵️‍♂️ PII Masking & NER Tool")
+st.markdown("Yüklediğiniz metin veya belgelerdeki (PDF/DOCX) hassas kişisel verileri tespit eder ve maskeler.")
+st.divider() # Araya şık bir çizgi çeker
 
-lang = st.selectbox("Language", ["en", "tr"])
+# SOL MENÜ (SIDEBAR) - Ayarlar ve yükleme işlemi burada yapılacak
+with st.sidebar:
+    st.header("⚙️ Ayarlar")
+    lang = st.selectbox("🌍 Dil Seçimi (Language)", ["en", "tr"])
+    
+    st.divider()
+    
+    st.header("📂 Dosya Yükle")
+    uploaded_file = st.file_uploader("PDF veya DOCX seçin", type=["pdf", "docx"])
 
+# ANA EKRAN İŞLEMLERİ
 if uploaded_file:
-
     file_bytes = uploaded_file.read()
 
     if uploaded_file.type == "application/pdf":
         raw_text = read_pdf(file_bytes)
-
     else:
         raw_text = read_docx(file_bytes)
 
-    st.subheader("Original Text")
+    # Analiz sırasında ekranda bekletme mesajı
+    with st.spinner("Metin analiz ediliyor ve maskeleniyor... Lütfen bekleyin. ⏳"):
+        summary, masked_text = analyze_text(raw_text, lang)
 
-    st.text_area("", raw_text, height=250)
+    # EKRANI İKİYE BÖLME (Yan yana görünüm)
+    col1, col2 = st.columns(2)
 
-    summary, masked_text = analyze_text(raw_text, lang)
+    with col1:
+        st.subheader("📄 Orijinal Metin")
+        st.text_area("İncelenen kaynak metin", raw_text, height=400)
 
-    st.subheader("Masked Text")
+    with col2:
+        st.subheader("🔒 Maskelenmiş Metin")
+        st.text_area("Hassas verileri gizlenmiş sonuç", masked_text, height=400)
 
-    st.text_area("", masked_text, height=250)
+    st.divider()
 
-    # İNDİRME SEÇENEKLERİ (DROPDOWN EKLENDİ)
-    st.subheader("Download / İndir")
-    export_format = st.selectbox("Format Seçin", ["PDF", "DOCX"])
+    # İNDİRME BÖLÜMÜ
+    st.subheader("⬇️ Sonucu İndir")
+    
+    # İndirme alanını da yan yana hizalayalım
+    d_col1, d_col2 = st.columns([1, 3]) 
+    
+    with d_col1:
+        export_format = st.selectbox("Format Seçin", ["PDF", "DOCX"])
 
-    if export_format == "PDF":
-        pdf_path = export_masked_pdf(masked_text)
-        st.download_button(
-            label="Download Masked PDF",
-            data=open(pdf_path, "rb").read(),
-            file_name="masked_output.pdf"
-        )
-    elif export_format == "DOCX":
-        docx_path = export_masked_docx(masked_text)
-        st.download_button(
-            label="Download Masked DOCX",
-            data=open(docx_path, "rb").read(),
-            file_name="masked_output.docx"
-        )
+    with d_col2:
+        st.markdown("<br>", unsafe_allow_html=True) # Butonu selectbox ile aynı hizaya indirmek için boşluk
+        
+        if export_format == "PDF":
+            pdf_path = export_masked_pdf(masked_text)
+            st.download_button(
+                label="📥 Maskelenmiş PDF Olarak İndir",
+                data=open(pdf_path, "rb").read(),
+                file_name="masked_output.pdf",
+                type="primary" # Butonun renkli ve belirgin olmasını sağlar
+            )
+        elif export_format == "DOCX":
+            docx_path = export_masked_docx(masked_text)
+            st.download_button(
+                label="📥 Maskelenmiş DOCX Olarak İndir",
+                data=open(docx_path, "rb").read(),
+                file_name="masked_output.docx",
+                type="primary"
+            )
+
+else:
+    # Dosya yüklenmediğinde ana ekranda duracak yönlendirme mesajı
+    st.info("👈 Lütfen analize başlamak için sol menüden (sidebar) bir dosya yükleyin.")
