@@ -1,4 +1,7 @@
 streamlit
+Wikipedia-API
 transformers
 torch
-pandas
+pdfplumber
+python-docx
+reportlab
