@@ -1,51 +1,84 @@
-import streamlit as st
+# ============================================================
+# IMPORTS
+# ============================================================
 import re
+import io
+import os
+import tempfile
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Tuple, Any
+from collections import defaultdict
+from functools import lru_cache
+
+import streamlit as st
+import wikipediaapi
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+import pdfplumber
+from docx import Document
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase import pdfmetrics
 
-# ----------------------------
-# STREAMLIT AYARLARI
-# ----------------------------
-st.set_page_config(page_title="PII Maskeleme", layout="wide")
-
-st.markdown("""
-    <style>
-    div.stButton > button:first-child {
-        background-color: #28a745;
-        color: white;
-        border: none;
-        padding: 10px 24px;
-        font-size: 16px;
-    }
-    div.stButton > button:first-child:hover {
-        background-color: #218838;
-        color: white;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# ----------------------------
-# Regex patterns
-# ----------------------------
+# ============================================================
+# REGEX PATTERNS
+# ============================================================
 REGEX_PATTERNS = {
-    "EMAIL": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
-    "PHONE": r"(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{2,4}",
-    "IP": r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-    "TCKN": r"\b\d{11}\b",
+    "TCKN": r"\b[1-9][0-9]{10}\b",
+    "PASSPORT": r"\b[A-Z0-9]{6,9}\b",
+    "IBAN": r"\bTR\d{2}\d{4}\d{4}\d{4}\d{4}\d{4}\d{2}\b",
     "CREDIT_CARD": r"\b(?:\d[ -]*?){13,16}\b",
-    "DATE_SIMPLE": r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
-    "ID": r"\b(?:ID|id|Id)[\s:.-]?[A-Za-z0-9]{3,}\b|\b[A-Z]{2,}\d{3,}\b|\b\d{3,}[A-Z]{2,}\b"
+    "EMAIL": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    "PHONE": r"(?:\+90|0)?\s?\(?[5]\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}",
+    "IP": r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
+    "DATE": r"\b\d{1,2}[./\s-]?\d{1,2}[./\s-]?\d{2,4}\b"
 }
 
-# ----------------------------
-# Public Figures List
-# ----------------------------
-PUBLIC_FIGURES = ["Elon Musk", "Barack Obama", "Angela Merkel"]
+PUBLIC_EMAIL_DOMAINS = [
+    "info@", "support@", "contact@", "admin@", "help@", "press@", "marketing@", "sales@",
+    "@amazon.com", "@spacex.com", "@google.com", "@microsoft.com", "@apple.com",
+    "@facebook.com", "@twitter.com", "@linkedin.com", "@hollywood.com"
+]
 
-# ----------------------------
-# Dataclass
-# ----------------------------
+def is_public_email(email: str) -> bool:
+    email_lower = email.lower()
+    return any(email_lower.startswith(p) or email_lower.endswith(p) for p in PUBLIC_EMAIL_DOMAINS)
+
+# ============================================================
+# FONT REGISTRATION FOR PDF
+# ============================================================
+def register_fonts() -> str:
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            pdfmetrics.registerFont(TTFont("CustomUnicodeFont", path))
+            return "CustomUnicodeFont"
+    return "Helvetica"
+
+DEFAULT_FONT = register_fonts()
+
+# ============================================================
+# FILE READING UTILITIES
+# ============================================================
+def read_pdf(file_bytes: bytes) -> str:
+    text = ""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text
+
+def read_docx(file_bytes: bytes) -> str:
+    doc = Document(io.BytesIO(file_bytes))
+    return "\n".join(p.text for p in doc.paragraphs)
+
+# ============================================================
+# DATA MODEL
+# ============================================================
 @dataclass
 class Annotation:
     type: str
@@ -56,280 +89,251 @@ class Annotation:
     level: int = None
     action: str = None
     reason: List[str] = field(default_factory=list)
+    placeholder: str = None
 
-# ----------------------------
-# BERT NER Pipeline
-# ----------------------------
+# ============================================================
+# BERT NER PIPELINE
+# ============================================================
 class BERTNER:
+    MODELS = {
+        "en": "dbmdz/bert-large-cased-finetuned-conll03-english",
+        "tr": "savasy/bert-base-turkish-ner-cased"
+    }
+    _pipes: Dict[str, Any] = {}
+
     def __init__(self):
-        self.models = {
-            "en": "dbmdz/bert-large-cased-finetuned-conll03-english",
-            "tr": "savasy/bert-base-turkish-ner-cased"
-        }
-        self.pipelines = {}
-        for lang, model_name in self.models.items():
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModelForTokenClassification.from_pretrained(model_name)
-            self.pipelines[lang] = pipeline(
-                "ner", model=model, tokenizer=tokenizer, aggregation_strategy="simple"
-            )
+        for lang, model_name in self.MODELS.items():
+            if lang not in self._pipes:
+                self._pipes[lang] = pipeline(
+                    "ner",
+                    model=AutoModelForTokenClassification.from_pretrained(model_name),
+                    tokenizer=AutoTokenizer.from_pretrained(model_name),
+                    aggregation_strategy="max"
+                )
 
     def predict(self, text: str, lang: str) -> List[Annotation]:
-        ner_results = self.pipelines[lang](text)
-        anns = []
-        for ent in ner_results:
-            anns.append(Annotation(
-                type=ent['entity_group'],
-                value=ent['word'],
-                start=ent['start'],
-                end=ent['end'],
+        return [
+            Annotation(
+                type=e["entity_group"],
+                value=e["word"],
+                start=e["start"],
+                end=e["end"],
                 source="bert"
-            ))
-        return anns
+            ) for e in self._pipes[lang](text)
+        ]
 
-# Streamlit'in her butona basışta modeli baştan indirmesini engellemek için cache kullanıyoruz.
-@st.cache_resource
-def get_bert_ner():
-    return BERTNER()
+bert_ner = BERTNER()
 
-# ----------------------------
-# Regex detection
-# ----------------------------
-def find_regex_candidates(text: str) -> List[Annotation]:
-    res = []
+# ============================================================
+# REGEX ENTITY DETECTION
+# ============================================================
+def find_regex_entities(text: str) -> List[Annotation]:
+    entities = []
     for label, pattern in REGEX_PATTERNS.items():
         for m in re.finditer(pattern, text):
-            res.append(Annotation(
-                type=label,
-                value=m.group(),
-                start=m.start(),
-                end=m.end(),
-                source="regex"
-            ))
-    return res
+            entities.append(Annotation(label, m.group(), m.start(), m.end(), "regex"))
+    return entities
 
-# ----------------------------
-# Merge Entities
-# ----------------------------
-def merge_entities(regex_es: List[Annotation], ml_es: List[Annotation]) -> List[Annotation]:
-    emails = [e for e in regex_es if e.type == "EMAIL"]
-    ids = [e for e in regex_es if e.type == "ID"]
-    
-    protected_spans = [(e.start, e.end) for e in emails + ids]
-    
-    filtered_ml = []
-    for ml_e in ml_es:
-        overlap = False
-        for ps, pe in protected_spans:
-            if not (ml_e.end <= ps or ml_e.start >= pe):
-                overlap = True
-                break
-        if not overlap:
-            filtered_ml.append(ml_e)
-    
-    other_regex = [e for e in regex_es if e.type not in ("EMAIL", "ID")]
-    
-    all_e = emails + ids + other_regex + filtered_ml
-    all_e.sort(key=lambda x: (x.start, -(x.end - x.start)))
-
+# ============================================================
+# MERGE REGEX + BERT ENTITIES
+# ============================================================
+def merge_entities(regex_entities: List[Annotation], bert_entities: List[Annotation]) -> List[Annotation]:
+    all_entities = sorted(regex_entities + bert_entities, key=lambda x: (x.start, -(x.end - x.start)))
     merged: List[Annotation] = []
-    for e in all_e:
+    priority = {"regex": 2, "bert": 1}
+
+    for e in all_entities:
         if not merged:
             merged.append(e)
             continue
-
         last = merged[-1]
-        if e.start < last.end:
-            if last.type in ("EMAIL", "ID"):
-                continue
-            elif e.type in ("EMAIL", "ID"):
-                merged[-1] = e
-            else:
-                priority = {"regex": 3, "bert": 2}
-                if priority.get(e.source, 1) > priority.get(last.source, 1):
-                    merged[-1] = e
-                elif priority.get(e.source, 1) == priority.get(last.source, 1):
-                    if (e.end - e.start) > (last.end - last.start):
-                        merged[-1] = e
-        else:
+        if e.start >= last.end:
             merged.append(e)
+        elif priority[e.source] > priority[last.source]:
+            merged[-1] = e
     return merged
 
-# ----------------------------
-# Contextual Scoring
-# ----------------------------
-def contextual_scoring(entity: Annotation, text: str) -> Dict[str, Any]:
-    res = {"level": None, "action": None, "reason": []}
+# ============================================================
+# WIKIPEDIA PUBLIC ENTITY CHECK
+# ============================================================
+wiki_en = wikipediaapi.Wikipedia(user_agent="Privacy_Tool", language="en")
+wiki_tr = wikipediaapi.Wikipedia(user_agent="Privacy_Tool", language="tr")
+
+@lru_cache(maxsize=1000)
+def is_public_entity(name: str, lang: str) -> bool:
+    wiki = wiki_tr if lang == "tr" else wiki_en
+    try:
+        clean_name = name.lower().strip()
+        page = wiki.page(clean_name)
+        if not page.exists() or len(page.text) < 500:
+            return False
+        categories = " ".join(page.categories.keys()).lower()
+        strong_signals = [
+            "president", "prime minister", "ceo", "founder", "politician",
+            "actor", "company", "siyasetçi", "cumhurbaşkanı", "şirket"
+        ]
+        return any(s in categories for s in strong_signals)
+    except:
+        return False
+
+# ============================================================
+# JURISDICTION SELECTION
+# ============================================================
+def select_jurisdiction(lang: str) -> str:
+    return "kvkk" if lang == "tr" else "gdpr"
+
+# ============================================================
+# CONTEXTUAL SCORING
+# ============================================================
+def contextual_scoring(entity: Annotation, text: str, lang: str) -> Tuple[int, str, List[str]]:
     etype = entity.type.upper()
     val = entity.value
+    jurisdiction = select_jurisdiction(lang)
 
-    if etype=="PERSON":
-        res.update({"level":1, "action":"MASK"})
-        if val in PUBLIC_FIGURES:
-            res["reason"].append("public_figure")
-        else:
-            res["reason"].append("person_default")
-        return res
+    if etype in ("PERSON", "ORG") and is_public_entity(val, lang):
+        return 3, "PASS", ["public_entity_wikipedia"]
 
-    if etype in ("TCKN","CREDIT_CARD","IP","ID"):
-        res.update({"level":1,"action":"MASK"})
-        res["reason"].append("explicit_identifier")
-        return res
+    if jurisdiction == "kvkk":
+        if etype in ("TCKN", "CREDIT_CARD", "PASSPORT", "IBAN"):
+            return 1, "MASK", ["kvkk_special_category"]
+        if etype == "EMAIL":
+            return (3, "PASS", ["public_email_pattern"]) if is_public_email(val) else (2, "MASK", ["kvkk_personal_data"])
+        if etype in ("PERSON", "PHONE", "DATE", "IP"):
+            return 2, "MASK", ["kvkk_personal_data"]
+        return 3, "PASS", ["kvkk_anonymous"]
 
-    if etype=="EMAIL":
-        res.update({"level":1,"action":"MASK"})
-        res["reason"].append("email_contact")
-        return res
+    if etype in ("EMAIL", "PHONE", "IP", "CREDIT_CARD"):
+        return 1, "MASK", ["gdpr_identifier"]
+    if etype == "PERSON":
+        return 2, "MASK", ["gdpr_person"]
+    return 3, "PASS", ["gdpr_low_risk"]
 
-    if etype=="PHONE":
-        res.update({"level":1,"action":"MASK"})
-        res["reason"].append("phone_contact")
-        return res
+# ============================================================
+# PLACEHOLDER MASKING
+# ============================================================
+def apply_placeholder_masking(text: str, annotations: List[Annotation]) -> Tuple[str, Dict]:
+    counters = defaultdict(int)
+    mapping = {}
+    display_labels = {"PHONE": "TEL_NUMBER", "DATE": "DATE"}
 
-    if etype.startswith("DATE"):
-        res.update({"level":2,"action":"MASK"})
-        res["reason"].append("date_default")
-        return res
+    for a in annotations:
+        if a.action != "MASK":
+            continue
+        key = (a.type.upper(), a.value)
+        if key not in mapping:
+            label = display_labels.get(a.type.upper(), a.type.upper())
+            counters[label] += 1
+            mapping[key] = f"[{label}_{counters[label]}]"
+        a.placeholder = mapping[key]
 
-    if etype in ("ORG","GPE","LOCATION","LOC"):
-        res.update({"level":3,"action":"PASS"})
-        res["reason"].append("org_location_pass")
-        return res
+    for a in sorted([x for x in annotations if x.action == "MASK"], key=lambda x: x.start, reverse=True):
+        text = text[:a.start] + a.placeholder + text[a.end:]
 
-    res.update({"level":1,"action":"MASK"})
-    res["reason"].append("default")
-    return res
+    return text, mapping
 
-# ----------------------------
-# Policy Manager
-# ----------------------------
-class PolicyManager:
-    def __init__(self, jurisdiction="gdpr"):
-        self.jurisdiction = jurisdiction.lower()
-
-    def decide(self, annotation: Annotation) -> Tuple[str,str]:
-        if self.jurisdiction=="gdpr":
-            if annotation.level==3: return "PASS","gdpr_low_risk"
-            if annotation.level in (1,2): return "MASK","gdpr_mask"
-        elif self.jurisdiction=="kvkk":
-            if annotation.level==3: return "PASS","kvkk_low_risk"
-            if annotation.level in (1,2): return "MASK","kvkk_mask"
-        return "MASK","default_mask"
-
-# ----------------------------
-# Masking Logic
-# ----------------------------
-DEFAULT_EMAIL_MASK = "***@***.com"
-DEFAULT_PHONE_MASK = "XXXXXXXXXX"
-DEFAULT_DATE_MASK = "XX/XX/XXXX"
-DEFAULT_ID_MASK = "[ID-REDACTED]"
-DEFAULT_REDACT_MASK = "[REDACTED]"
-
-def apply_masking(text:str, annotations:List[Annotation]) -> str:
-    masked = text
-    mask_items = sorted([a for a in annotations if a.action=="MASK"], key=lambda x:x.start, reverse=True)
-    for a in mask_items:
-        mask = DEFAULT_REDACT_MASK
-        if a.type=="EMAIL":
-            email_val = a.value
-            if "@" in email_val:
-                parts = email_val.split("@")
-                user_part = parts[0]
-                domain_part = parts[1]
-                
-                if len(user_part) >= 1:
-                    masked_user = user_part[0] + "*" * max(1, len(user_part) - 1)
-                else:
-                    masked_user = "*"
-                
-                if len(domain_part) >= 4:
-                    masked_domain = "*" * (len(domain_part) - 4) + domain_part[-4:]
-                else:
-                    masked_domain = "*" * len(domain_part)
-                
-                mask = masked_user + "@" + masked_domain
-            else:
-                mask = DEFAULT_EMAIL_MASK
-        elif a.type=="PHONE": 
-            mask = DEFAULT_PHONE_MASK
-        elif a.type.startswith("DATE"): 
-            mask = DEFAULT_DATE_MASK
-        elif a.type=="ID": 
-            mask = DEFAULT_ID_MASK
-
-        s,e = a.start, a.end
-        masked = masked[:s] + mask + masked[e:]
-    return masked
-
-# ----------------------------
-# Summary Table
-# ----------------------------
-def summary_table(annotations:List[Annotation]) -> str:
+# ============================================================
+# SUMMARY TABLE
+# ============================================================
+def summary_table(annotations: List[Annotation]) -> str:
     lines = ["Value | Type | Level | Action | Reason"]
     for a in annotations:
-        reason_str = ", ".join(a.reason) if a.reason else "N/A"
-        lines.append(f"{a.value} | {a.type} | {a.level} | {a.action} | {reason_str}")
+        lines.append(f"{a.value} | {a.type} | {a.level} | {a.action} | {', '.join(a.reason)}")
     return "\n".join(lines)
 
-# ----------------------------
-# Main Function
-# ----------------------------
-def analyze_text(text:str, lang:str="en") -> Tuple[str,str]:
-    bert_ner = get_bert_ner()
-    regex_candidates = find_regex_candidates(text)
-    ml_entities = bert_ner.predict(text, lang)
-    merged = merge_entities(regex_candidates, ml_entities)
+# ============================================================
+# PDF / DOCX EXPORT
+# ============================================================
+def export_masked_pdf(text: str) -> str:
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    c = canvas.Canvas(temp_file.name, pagesize=A4)
+    width, height = A4
+    y = height - 50
+    c.setFont(DEFAULT_FONT, 12)
+    for line in text.split("\n"):
+        c.drawString(50, y, line)
+        y -= 15
+        if y < 50:
+            c.showPage()
+            y = height - 50
+            c.setFont(DEFAULT_FONT, 12)
+    c.save()
+    return temp_file.name
 
-    # DİNAMİK YASA SEÇİMİ: Türkçe ise KVKK, İngilizce ise GDPR çalışsın
-    jurisdiction = "kvkk" if lang == "tr" else "gdpr"
-    policy_mgr = PolicyManager(jurisdiction)
-
-    annotations = []
-    for e in merged:
-        score = contextual_scoring(e, text)
-        e.level = score["level"]
-        e.reason = score["reason"]
-        e.action, pol = policy_mgr.decide(e)
-        e.reason.append(pol)
-        annotations.append(e)
-
-    masked_text = apply_masking(text, annotations)
-    table = summary_table(annotations)
-    return table, masked_text
-
+def export_masked_docx(text: str) -> str:
+    doc = Document()
+    for line in text.split("\n"):
+        doc.add_paragraph(line)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+    doc.save(temp_file.name)
+    return temp_file.name
 
 # ============================================================
-#               STREAMLIT ARAYÜZÜ
+# MAIN ANALYSIS FUNCTION
 # ============================================================
+def analyze_text(text: str, lang: str = "en") -> Tuple[str, str]:
+    regex_entities = find_regex_entities(text)
+    bert_entities = bert_ner.predict(text, lang)
+    merged_entities = merge_entities(regex_entities, bert_entities)
 
-st.title("Yapay Zeka Destekli PII Maskeleme")
+    for e in merged_entities:
+        level, action, reason = contextual_scoring(e, text, lang)
+        e.level = level
+        e.action = action
+        e.reason = reason
 
-with st.sidebar:
-    st.header("Sistem Ayarları")
-    lang_select = st.selectbox(
-        "Dil Seçiniz:",
-        options=["en", "tr"],
-        format_func=lambda x: "Türkçe (KVKK)" if x == "tr" else "English (GDPR)"
-    )
+    masked_text, _ = apply_placeholder_masking(text, merged_entities)
+    return summary_table(merged_entities), masked_text
 
-text_input = st.text_area("Analiz edilecek metni buraya yapıştırın:", height=150)
+# ============================================================
+# STREAMLIT INTERFACE
+# ============================================================
+st.set_page_config(page_title="PII Masking Tool", layout="wide")
+st.title("📄 PII Masking & NER Tool")
+st.markdown("PDF/DOCX veya metin dosyalarını okuyarak kişisel verileri maskeleyebilirsiniz.")
 
-if st.button("Analiz Et"):
-    if not text_input.strip():
-        st.warning("⚠ Lütfen metin girin.")
-    else:
-        with st.spinner("Modeller çalışıyor, lütfen bekleyin..."):
-            table, masked = analyze_text(text_input, lang_select)
+uploaded_file = st.file_uploader("Dosya seçin (PDF veya DOCX)", type=["pdf", "docx"])
+lang_option = st.selectbox("Dil seçin", ["en", "tr"], index=0)
 
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Orijinal Metin")
-                st.info(text_input)
-                
-            with col2:
-                st.subheader("Maskelenmiş Metin")
-                st.success(masked)
+if uploaded_file:
+    file_bytes = uploaded_file.read()
+    try:
+        if uploaded_file.type == "application/pdf":
+            raw_text = read_pdf(file_bytes)
+        elif uploaded_file.type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"):
+            raw_text = read_docx(file_bytes)
+        else:
+            st.error("Desteklenmeyen dosya türü.")
+            raw_text = ""
+    except Exception as e:
+        st.error(f"Dosya okunamadı: {e}")
+        raw_text = ""
 
-            st.subheader("📑 Özet Tablosu")
-            st.text(table)
+    if raw_text:
+        st.subheader("📋 Orijinal Metin")
+        st.text_area("Original Text", raw_text, height=300)
+
+        with st.spinner("Metin analiz ediliyor..."):
+            summary, masked_text = analyze_text(raw_text, lang_option)
+
+        st.subheader("🔒 Maskelenmiş Metin")
+        st.text_area("Masked Text", masked_text, height=300)
+
+        st.subheader("📝 Summary Table")
+        st.text_area("Summary Table", summary, height=300)
+
+        pdf_path = export_masked_pdf(masked_text)
+        docx_path = export_masked_docx(masked_text)
+
+        st.download_button(
+            label="📥 Masked PDF İndir",
+            data=open(pdf_path, "rb").read(),
+            file_name="masked_output.pdf",
+            mime="application/pdf"
+        )
+
+        st.download_button(
+            label="📥 Masked DOCX İndir",
+            data=open(docx_path, "rb").read(),
+            file_name="masked_output.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
