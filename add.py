@@ -60,7 +60,7 @@ def tckn_check(tckn: str) -> bool:
 
 
 # ============================================================
-# REGEX PATTERNS 
+# REGEX PATTERNS (GÜNCELLENDİ)
 # ============================================================
 
 REGEX_PATTERNS = {
@@ -82,13 +82,14 @@ def is_public_email(email: str) -> bool:
 
 
 # ============================================================
-# FONT (UNICODE SUPPORT) 
+# FONT (UNICODE SUPPORT) - TÜRKÇE KARAKTER SORUNU İÇİN
 # ============================================================
 
 def register_fonts():
     import urllib.request
     font_path = "Roboto-Regular.ttf"
     
+    # 1. Klasörde font yoksa internetten Türkçe destekli Roboto fontunu otomatik indir
     if not os.path.exists(font_path):
         try:
             url = "https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf"
@@ -100,17 +101,18 @@ def register_fonts():
         pdfmetrics.registerFont(TTFont("Roboto", font_path))
         return "Roboto"
 
+    # 2. İndirme başarısız olursa yerel sistemlerdeki (Windows/Mac/Linux) Türkçe fontları ara
     local_fonts = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 
-        "C:\\Windows\\Fonts\\arial.ttf",                   
-        "/Library/Fonts/Arial.ttf"                         
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", # Linux
+        "C:\\Windows\\Fonts\\arial.ttf",                   # Windows
+        "/Library/Fonts/Arial.ttf"                         # Mac
     ]
     for path in local_fonts:
         if os.path.exists(path):
             pdfmetrics.registerFont(TTFont("LocalUTF8", path))
             return "LocalUTF8"
             
-    return "Helvetica"
+    return "Helvetica" # Son çare
 
 DEFAULT_FONT = register_fonts()
 
@@ -120,17 +122,21 @@ DEFAULT_FONT = register_fonts()
 # ============================================================
 
 def read_pdf_smart(file_bytes: bytes) -> str:
+    """Önce dijital metni okur, metin yoksa OCR (Tesseract) çalıştırır."""
     text = ""
+    # 1. Standart PDF okuma
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t: text += t + "\n"
     
+    # 2. Eğer sayfa sayısı var ama metin yoksa (Taranmış PDF)
     if len(text.strip()) < 10:
-        with st.status("OCR çalıştırılıyor (Taranmış PDF tespit edildi)..."):
+        with st.status("OCR çalıştırılıyor (Taranmış belge tespit edildi)..."):
             images = convert_from_path(io.BytesIO(file_bytes), dpi=300)
             ocr_text = ""
             for img in images:
+                # Türkçe ve İngilizce desteği ile okuma
                 ocr_text += pytesseract.image_to_string(img, lang='tur+eng') + "\n"
             return ocr_text
     return text
@@ -138,12 +144,6 @@ def read_pdf_smart(file_bytes: bytes) -> str:
 def read_docx(file_bytes: bytes) -> str:
     doc = Document(io.BytesIO(file_bytes))
     return "\n".join(p.text for p in doc.paragraphs)
-
-def read_image(file_bytes: bytes) -> str:
-    with st.status("Görsel OCR ile analiz ediliyor..."):
-        img = Image.open(io.BytesIO(file_bytes))
-        ocr_text = pytesseract.image_to_string(img, lang='tur+eng')
-        return ocr_text
 
 
 # ============================================================
@@ -164,26 +164,31 @@ class Annotation:
 
 
 # ============================================================
-# MEMORY OPTIMIZED BERT NER (RAM DOSTU YAPI)
+# BERT NER & WIKIPEDIA
 # ============================================================
 
-@st.cache_resource
-def load_ner_model(lang: str):
-    """Yapay zeka modelini RAM'i doldurmamak için sadece gerektiğinde yükler."""
-    models = {
-        "en": "dslim/bert-base-NER", # Large model yerine RAM dostu base model kullanıldı
+class BERTNER:
+    MODELS = {
+        "en": "dbmdz/bert-large-cased-finetuned-conll03-english",
         "tr": "savasy/bert-base-turkish-ner-cased"
     }
-    model_name = models[lang]
-    return pipeline("ner", model=model_name, tokenizer=model_name, aggregation_strategy="max")
+    _pipes = {}
 
-def predict_ner(text: str, lang: str):
-    pipe = load_ner_model(lang)
-    return [
-        Annotation(type=e["entity_group"], value=e["word"], 
-                   start=e["start"], end=e["end"], source="bert")
-        for e in pipe(text)
-    ]
+    def __init__(self):
+        for lang, model in self.MODELS.items():
+            if lang not in self._pipes:
+                self._pipes[lang] = pipeline(
+                    "ner", model=model, tokenizer=model, aggregation_strategy="max"
+                )
+
+    def predict(self, text: str, lang: str):
+        return [
+            Annotation(type=e["entity_group"], value=e["word"], 
+                       start=e["start"], end=e["end"], source="bert")
+            for e in self._pipes[lang](text)
+        ]
+
+bert_ner = BERTNER()
 
 wiki_en = wikipediaapi.Wikipedia(user_agent="privacy_tool", language="en")
 wiki_tr = wikipediaapi.Wikipedia(user_agent="privacy_tool", language="tr")
@@ -209,6 +214,7 @@ def find_regex_entities(text: str):
     for label, pattern in REGEX_PATTERNS.items():
         for m in re.finditer(pattern, text):
             val = m.group()
+            # Checksum Doğrulamaları
             if label == "TCKN" and not tckn_check(val): continue
             if label == "CREDIT_CARD" and not luhn_check(val): continue
             
@@ -236,6 +242,7 @@ def contextual_scoring(entity, lang):
     if etype in ("PERSON", "ORG") and is_public_entity(val, lang):
         return 3, "PASS", ["public_entity"]
     
+    # Duyarlı türler
     if etype in ("TCKN", "CREDIT_CARD", "IBAN", "PASSPORT"):
         return 1, "MASK", ["high_risk_pii"]
     if etype in ("PERSON", "PHONE", "EMAIL", "DATE", "IP"):
@@ -244,9 +251,11 @@ def contextual_scoring(entity, lang):
     return 3, "PASS", ["low_risk"]
 
 def apply_smart_masking(text, annotations):
+    """Pseudonymization: 'Ahmet' -> [PERSON_1]"""
     counters = defaultdict(int)
     mapping = {}
     
+    # 1. Mapping oluştur (Aynı değere aynı placeholder)
     for a in annotations:
         if a.action != "MASK": continue
         key = (a.type, a.value.strip().lower())
@@ -255,6 +264,7 @@ def apply_smart_masking(text, annotations):
             mapping[key] = f"[{a.type}_{counters[a.type]}]"
         a.placeholder = mapping[key]
 
+    # 2. Metni güncelle (Sondan başa)
     sorted_anns = sorted([a for a in annotations if a.placeholder], key=lambda x: x.start, reverse=True)
     for a in sorted_anns:
         text = text[:a.start] + a.placeholder + text[a.end:]
@@ -307,7 +317,7 @@ def export_masked_docx(text):
 
 def analyze_text(text, lang):
     regex_entities = find_regex_entities(text)
-    bert_entities = predict_ner(text, lang) # Güncellenen fonksiyon kullanıldı
+    bert_entities = bert_ner.predict(text, lang)
     merged = merge_entities(regex_entities, bert_entities)
 
     for e in merged:
@@ -328,7 +338,7 @@ st.set_page_config(page_title="PII Masking Tool", layout="wide")
 
 st.title("PII Masking & NER Tool")
 
-uploaded_file = st.file_uploader("Upload PDF, DOCX or Image", type=["pdf", "docx", "png", "jpg", "jpeg"])
+uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
 
 lang = st.selectbox("Language", ["en", "tr"])
 
@@ -336,38 +346,33 @@ if uploaded_file:
     file_bytes = uploaded_file.read()
 
     if uploaded_file.type == "application/pdf":
-        raw_text = read_pdf_smart(file_bytes)
-    elif uploaded_file.name.endswith(".docx") or "wordprocessingml" in uploaded_file.type:
-        raw_text = read_docx(file_bytes)
-    elif uploaded_file.type in ["image/png", "image/jpeg", "image/jpg"]:
-        raw_text = read_image(file_bytes)
+        raw_text = read_pdf_smart(file_bytes) # Akıllı okuyucu eklendi (OCR)
     else:
-        st.error("Desteklenmeyen dosya formatı!")
-        raw_text = ""
+        raw_text = read_docx(file_bytes)
 
-    if raw_text:
-        st.subheader("Original Text")
-        st.text_area("", raw_text, height=250)
+    st.subheader("Original Text")
+    st.text_area("", raw_text, height=250)
 
-        summary, masked_text = analyze_text(raw_text, lang)
+    summary, masked_text = analyze_text(raw_text, lang)
 
-        st.subheader("Masked Text")
-        st.text_area("", masked_text, height=250)
+    st.subheader("Masked Text")
+    st.text_area("", masked_text, height=250)
 
-        st.subheader("Download / İndir")
-        export_format = st.selectbox("Format Seçin", ["PDF", "DOCX"])
+    # İNDİRME SEÇENEKLERİ (DROPDOWN EKLENDİ)
+    st.subheader("Download / İndir")
+    export_format = st.selectbox("Format Seçin", ["PDF", "DOCX"])
 
-        if export_format == "PDF":
-            pdf_path = export_masked_pdf(masked_text)
-            st.download_button(
-                label="Download Masked PDF",
-                data=open(pdf_path, "rb").read(),
-                file_name="masked_output.pdf"
-            )
-        elif export_format == "DOCX":
-            docx_path = export_masked_docx(masked_text)
-            st.download_button(
-                label="Download Masked DOCX",
-                data=open(docx_path, "rb").read(),
-                file_name="masked_output.docx"
-            )
+    if export_format == "PDF":
+        pdf_path = export_masked_pdf(masked_text)
+        st.download_button(
+            label="Download Masked PDF",
+            data=open(pdf_path, "rb").read(),
+            file_name="masked_output.pdf"
+        )
+    elif export_format == "DOCX":
+        docx_path = export_masked_docx(masked_text)
+        st.download_button(
+            label="Download Masked DOCX",
+            data=open(docx_path, "rb").read(),
+            file_name="masked_output.docx"
+        )
