@@ -1,12 +1,6 @@
-# ============================================================
-# IMPORTS
-# ============================================================
-import re
-import io
-import os
-import tempfile
+import re, io, tempfile, os
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Any
+from typing import List
 from collections import defaultdict
 from functools import lru_cache
 
@@ -16,38 +10,41 @@ from transformers import AutoTokenizer, AutoModelForTokenClassification, pipelin
 import pdfplumber
 from docx import Document
 from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
+from PIL import Image
+import pytesseract
+import numpy as np
+import cv2
+import streamlit.components.v1 as components
 
 # ============================================================
-# REGEX PATTERNS
+# REGEX DESENLERİ
 # ============================================================
 REGEX_PATTERNS = {
-    "TCKN": r"\b[1-9][0-9]{10}\b",
-    "PASSPORT": r"\b[A-Z0-9]{6,9}\b",
-    "IBAN": r"\bTR\d{2}\d{4}\d{4}\d{4}\d{4}\d{4}\d{2}\b",
+    "DATE": r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}[-/]\d{1,2}([-./]\d{2,4})\b",
+    "PHONE": r"(?<!\d)(?:(?:\+|00)?90[\s\-]?|0[\s\-]?)?\(?5\d{2}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}(?!\d)",
+    "IBAN": r"\bTR\d{2}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}[\s]?\d{2}\b",
     "CREDIT_CARD": r"\b(?:\d[ -]*?){13,16}\b",
-    "EMAIL": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-    "PHONE": r"(?:\+90|0)?\s?\(?[5]\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}",
+    "EMAIL": r"[a-zA-Z0-9._%+\-çğıöşüÇĞIİÖŞÜ]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
     "IP": r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
-    "DATE": r"\b\d{1,2}[./\s-]?\d{1,2}[./\s-]?\d{2,4}\b"
+    "TCKN": r"\b[1-9][0-9]{10}\b",
+    "PASSPORT": r"\b(?=.*[A-Z])[A-Z0-9]{6,9}\b",
 }
+REGEX_ORDER = ["PHONE", "IBAN", "CREDIT_CARD", "EMAIL", "TCKN", "PASSPORT", "IP", "DATE"]
 
-PUBLIC_EMAIL_DOMAINS = [
-    "info@", "support@", "contact@", "admin@", "help@", "press@", "marketing@", "sales@",
-    "@amazon.com", "@spacex.com", "@google.com", "@microsoft.com", "@apple.com",
-    "@facebook.com", "@twitter.com", "@linkedin.com", "@hollywood.com"
-]
+PRIVATE_EMAIL_DOMAINS = ["@gmail.com", "@yahoo.com", "@outlook.com"]
 
-def is_public_email(email: str) -> bool:
-    email_lower = email.lower()
-    return any(email_lower.startswith(p) or email_lower.endswith(p) for p in PUBLIC_EMAIL_DOMAINS)
+def is_private_email(email: str) -> bool:
+    return any(email.lower().endswith(d) for d in PRIVATE_EMAIL_DOMAINS)
 
 # ============================================================
-# FONT REGISTRATION FOR PDF
+# FONT KAYIT
 # ============================================================
-def register_fonts() -> str:
+def register_fonts():
     font_paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
@@ -61,7 +58,7 @@ def register_fonts() -> str:
 DEFAULT_FONT = register_fonts()
 
 # ============================================================
-# FILE READING UTILITIES
+# DOSYA OKUMA
 # ============================================================
 def read_pdf(file_bytes: bytes) -> str:
     text = ""
@@ -74,7 +71,18 @@ def read_pdf(file_bytes: bytes) -> str:
 
 def read_docx(file_bytes: bytes) -> str:
     doc = Document(io.BytesIO(file_bytes))
-    return "\n".join(p.text for p in doc.paragraphs)
+    return "\n".join([p.text for p in doc.paragraphs])
+
+def read_image(file_bytes: bytes) -> str:
+    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    w, h = image.size
+    image = image.resize((w * 2, h * 2), Image.LANCZOS)
+    text = pytesseract.image_to_string(
+        image,
+        lang="tur+eng",
+        config="--oem 3 --psm 3"
+    )
+    return text
 
 # ============================================================
 # DATA MODEL
@@ -92,248 +100,419 @@ class Annotation:
     placeholder: str = None
 
 # ============================================================
-# BERT NER PIPELINE
+# BERT NER
 # ============================================================
-class BERTNER:
-    MODELS = {
-        "en": "dbmdz/bert-large-cased-finetuned-conll03-english",
-        "tr": "savasy/bert-base-turkish-ner-cased"
+@st.cache_resource(show_spinner="🤖 NER modeli yükleniyor...")
+def load_ner_pipelines():
+    models = {
+        "tr": "savasy/bert-base-turkish-ner-cased",
     }
-    _pipes: Dict[str, Any] = {}
+    pipes = {}
+    for lang, model_name in models.items():
+        pipes[lang] = pipeline(
+            "ner",
+            model=AutoModelForTokenClassification.from_pretrained(model_name),
+            tokenizer=AutoTokenizer.from_pretrained(model_name),
+            aggregation_strategy="max",
+        )
+    return pipes
 
-    def __init__(self):
-        for lang, model_name in self.MODELS.items():
-            if lang not in self._pipes:
-                self._pipes[lang] = pipeline(
-                    "ner",
-                    model=AutoModelForTokenClassification.from_pretrained(model_name),
-                    tokenizer=AutoTokenizer.from_pretrained(model_name),
-                    aggregation_strategy="max"
-                )
-
-    def predict(self, text: str, lang: str) -> List[Annotation]:
-        return [
-            Annotation(
-                type=e["entity_group"],
-                value=e["word"],
-                start=e["start"],
-                end=e["end"],
-                source="bert"
-            ) for e in self._pipes[lang](text)
-        ]
-
-bert_ner = BERTNER()
+def predict_bert(text: str, lang: str, pipes: dict) -> List[Annotation]:
+    return [
+        Annotation(
+            type=e["entity_group"],
+            value=e["word"],
+            start=e["start"],
+            end=e["end"],
+            source="bert",
+        )
+        for e in pipes[lang](text)
+    ]
 
 # ============================================================
-# REGEX ENTITY DETECTION
+# REGEX TESPİTİ
 # ============================================================
 def find_regex_entities(text: str) -> List[Annotation]:
-    entities = []
-    for label, pattern in REGEX_PATTERNS.items():
-        for m in re.finditer(pattern, text):
-            entities.append(Annotation(label, m.group(), m.start(), m.end(), "regex"))
-    return entities
+    out = []
+    for label in REGEX_ORDER:
+        for m in re.finditer(REGEX_PATTERNS[label], text, re.MULTILINE | re.DOTALL):
+            out.append(Annotation(label, m.group(), m.start(), m.end(), "regex"))
+    return out
 
 # ============================================================
-# MERGE REGEX + BERT ENTITIES
+# ENTITY MERGE
 # ============================================================
-def merge_entities(regex_entities: List[Annotation], bert_entities: List[Annotation]) -> List[Annotation]:
-    all_entities = sorted(regex_entities + bert_entities, key=lambda x: (x.start, -(x.end - x.start)))
-    merged: List[Annotation] = []
-    priority = {"regex": 2, "bert": 1}
-
-    for e in all_entities:
+def merge_entities(a: List[Annotation], b: List[Annotation]) -> List[Annotation]:
+    priority = {"TCKN": 5, "PHONE": 3, "IBAN": 6, "CREDIT_CARD": 5, "EMAIL": 4, "DATE": 2, "IP": 3}
+    all_e = sorted(a + b, key=lambda x: (x.start, -(x.end - x.start)))
+    merged = []
+    for e in all_e:
         if not merged:
             merged.append(e)
-            continue
-        last = merged[-1]
-        if e.start >= last.end:
+        elif e.start >= merged[-1].end:
             merged.append(e)
-        elif priority[e.source] > priority[last.source]:
+        elif priority.get(e.type.upper(), 2) > priority.get(merged[-1].type.upper(), 1):
             merged[-1] = e
     return merged
 
 # ============================================================
 # WIKIPEDIA PUBLIC ENTITY CHECK
 # ============================================================
-wiki_en = wikipediaapi.Wikipedia(user_agent="Privacy_Tool", language="en")
-wiki_tr = wikipediaapi.Wikipedia(user_agent="Privacy_Tool", language="tr")
-
 @lru_cache(maxsize=1000)
 def is_public_entity(name: str, lang: str) -> bool:
-    wiki = wiki_tr if lang == "tr" else wiki_en
+    clean_name = re.sub(r"[''].*$", "", name).strip()
     try:
-        clean_name = name.lower().strip()
-        page = wiki.page(clean_name)
-        if not page.exists() or len(page.text) < 500:
-            return False
-        categories = " ".join(page.categories.keys()).lower()
-        strong_signals = [
-            "president", "prime minister", "ceo", "founder", "politician",
-            "actor", "company", "siyasetçi", "cumhurbaşkanı", "şirket"
-        ]
-        return any(s in categories for s in strong_signals)
-    except:
+        wiki = wikipediaapi.Wikipedia(
+            user_agent="PII_Masking_App/1.0 (contact@example.com)",
+            language=lang,
+            extract_format=wikipediaapi.ExtractFormat.WIKI,
+        )
+        return wiki.page(clean_name).exists()
+    except Exception:
         return False
 
 # ============================================================
-# JURISDICTION SELECTION
+# CONTEXTUAL SCORING (ONLY KVKK)
 # ============================================================
-def select_jurisdiction(lang: str) -> str:
-    return "kvkk" if lang == "tr" else "gdpr"
-
-# ============================================================
-# CONTEXTUAL SCORING
-# ============================================================
-def contextual_scoring(entity: Annotation, text: str, lang: str) -> Tuple[int, str, List[str]]:
-    etype = entity.type.upper()
+def contextual_scoring(entity: Annotation, text: str, lang: str):
+    et = entity.type.upper()
+    if et == "PER":
+        et = "PERSON"
+    if et == "LOC":
+        et = "LOCATION"
+    entity.type = et
     val = entity.value
-    jurisdiction = select_jurisdiction(lang)
 
-    if etype in ("PERSON", "ORG") and is_public_entity(val, lang):
+    if et in ("PERSON", "LOCATION", "ORG") and val and val[0].islower():
+        return 3, "PASS", ["bert_false_positive_lowercase"]
+    if et in ("PERSON", "ORG", "LOCATION") and is_public_entity(val, lang):
         return 3, "PASS", ["public_entity_wikipedia"]
 
-    if jurisdiction == "kvkk":
-        if etype in ("TCKN", "CREDIT_CARD", "PASSPORT", "IBAN"):
-            return 1, "MASK", ["kvkk_special_category"]
-        if etype == "EMAIL":
-            return (3, "PASS", ["public_email_pattern"]) if is_public_email(val) else (2, "MASK", ["kvkk_personal_data"])
-        if etype in ("PERSON", "PHONE", "DATE", "IP"):
-            return 2, "MASK", ["kvkk_personal_data"]
-        return 3, "PASS", ["kvkk_anonymous"]
-
-    if etype in ("EMAIL", "PHONE", "IP", "CREDIT_CARD"):
-        return 1, "MASK", ["gdpr_identifier"]
-    if etype == "PERSON":
-        return 2, "MASK", ["gdpr_person"]
-    return 3, "PASS", ["gdpr_low_risk"]
+    # Sadece KVKK mantığı
+    if et in ("TCKN", "CREDIT_CARD", "PASSPORT", "IBAN"):
+        return 1, "MASK", ["kvkk_special_category"]
+    if et == "EMAIL":
+        if is_private_email(val):
+            return 2, "MASK", ["private_email_domain"]
+        return 3, "PASS", ["non_private_email"]
+    if et in ("PERSON", "PHONE", "DATE", "IP", "LOCATION", "ORG"):
+        return 2, "MASK", ["kvkk_personal_data"]
+    
+    return 3, "PASS", ["kvkk_anonymous"]
 
 # ============================================================
-# PLACEHOLDER MASKING
+# MASKING
 # ============================================================
-def apply_placeholder_masking(text: str, annotations: List[Annotation]) -> Tuple[str, Dict]:
+def apply_placeholder_masking(text: str, annotations: List[Annotation]):
     counters = defaultdict(int)
     mapping = {}
-    display_labels = {"PHONE": "TEL_NUMBER", "DATE": "DATE"}
-
+    display_labels = {
+        "PHONE": "TEL_NUMBER", "DATE": "DATE",
+        "PERSON": "PERSON", "LOCATION": "LOCATION", "ORG": "ORGANIZATION",
+    }
     for a in annotations:
         if a.action != "MASK":
             continue
         key = (a.type.upper(), a.value)
         if key not in mapping:
-            label = display_labels.get(a.type.upper(), a.type.upper())
-            counters[label] += 1
-            mapping[key] = f"[{label}_{counters[label]}]"
+            base_label = display_labels.get(a.type.upper(), a.type.upper())
+            counters[base_label] += 1
+            mapping[key] = f"[{base_label}_{counters[base_label]}]"
         a.placeholder = mapping[key]
 
     for a in sorted([x for x in annotations if x.action == "MASK"], key=lambda x: x.start, reverse=True):
         text = text[:a.start] + a.placeholder + text[a.end:]
-
     return text, mapping
 
 # ============================================================
-# SUMMARY TABLE
+# EXPORT
 # ============================================================
-def summary_table(annotations: List[Annotation]) -> str:
-    lines = ["Value | Type | Level | Action | Reason"]
-    for a in annotations:
-        lines.append(f"{a.value} | {a.type} | {a.level} | {a.action} | {', '.join(a.reason)}")
-    return "\n".join(lines)
-
-# ============================================================
-# PDF / DOCX EXPORT
-# ============================================================
-def export_masked_pdf(text: str) -> str:
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    c = canvas.Canvas(temp_file.name, pagesize=A4)
-    width, height = A4
-    y = height - 50
-    c.setFont(DEFAULT_FONT, 12)
+def export_masked_pdf(text: str) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4)
+    styles = getSampleStyleSheet()
+    style = styles["Normal"]
+    style.fontName = DEFAULT_FONT
+    style.fontSize = 11
+    style.leading = 14
+    story = []
     for line in text.split("\n"):
-        c.drawString(50, y, line)
-        y -= 15
-        if y < 50:
-            c.showPage()
-            y = height - 50
-            c.setFont(DEFAULT_FONT, 12)
-    c.save()
-    return temp_file.name
+        if line.strip() == "":
+            story.append(Spacer(1, 8))
+        else:
+            story.append(Paragraph(line, style))
+    doc.build(story)
+    return buf.getvalue()
 
-def export_masked_docx(text: str) -> str:
+def export_masked_docx(text: str) -> bytes:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     doc = Document()
     for line in text.split("\n"):
-        doc.add_paragraph(line)
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
-    doc.save(temp_file.name)
-    return temp_file.name
+        p = doc.add_paragraph(line)
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 # ============================================================
-# MAIN ANALYSIS FUNCTION
+# ANA ANALİZ FONKSİYONU
 # ============================================================
-def analyze_text(text: str, lang: str = "en") -> Tuple[str, str]:
-    regex_entities = find_regex_entities(text)
-    bert_entities = bert_ner.predict(text, lang)
-    merged_entities = merge_entities(regex_entities, bert_entities)
-
-    for e in merged_entities:
-        level, action, reason = contextual_scoring(e, text, lang)
-        e.level = level
-        e.action = action
-        e.reason = reason
-
-    masked_text, _ = apply_placeholder_masking(text, merged_entities)
-    return summary_table(merged_entities), masked_text
+def analyze_text(text: str, lang: str, pipes: dict):
+    regex_e = find_regex_entities(text)
+    bert_e = predict_bert(text, lang, pipes)
+    entities = merge_entities(regex_e, bert_e)
+    for e in entities:
+        lvl, act, rsn = contextual_scoring(e, text, lang)
+        e.level = lvl
+        e.action = act
+        e.reason = rsn
+    masked_text, mapping = apply_placeholder_masking(text, entities)
+    return entities, masked_text, mapping
 
 # ============================================================
-# STREAMLIT INTERFACE
+# STREAMLIT UI
 # ============================================================
-st.set_page_config(page_title="PII Masking Tool", layout="wide")
-st.title("📄 PII Masking & NER Tool")
-st.markdown("PDF/DOCX veya metin dosyalarını okuyarak kişisel verileri maskeleyebilirsiniz.")
+st.set_page_config(
+    page_title="PII Masking Studio",
+    page_icon="🛡️",
+    layout="wide",
+)
 
-uploaded_file = st.file_uploader("Dosya seçin (PDF veya DOCX)", type=["pdf", "docx"])
-lang_option = st.selectbox("Dil seçin", ["en", "tr"], index=0)
+# Dil seçimi kaldırıldı, varsayılan Türkçe (tr) olarak sabitlendi
+lang = "tr"
 
-if uploaded_file:
-    file_bytes = uploaded_file.read()
-    try:
-        if uploaded_file.type == "application/pdf":
-            raw_text = read_pdf(file_bytes)
-        elif uploaded_file.type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"):
-            raw_text = read_docx(file_bytes)
+
+
+
+# ---------- CUSTOM CSS ----------
+st.markdown("""
+<style>
+/* BACKGROUND */
+body {
+    background: radial-gradient(circle at 20% 20%, #0f172a, #020617);
+}
+body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image: 
+        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+}
+body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(circle at 80% 20%, rgba(0,255,200,0.08), transparent 40%);
+    pointer-events: none;
+}
+/* HEADER */
+.title {
+    font-size: 34px;
+    font-weight: 700;
+    color: white;
+}
+.subtitle {
+    color: #94a3b8;
+    margin-bottom: 25px;
+}
+/* CARD */
+.input-card {
+    text-align: center;
+    padding: 25px;
+    border-radius: 18px;
+    background: rgba(255,255,255,0.04);
+    transition: 0.25s;
+}
+.input-card:hover {
+    transform: translateY(-6px) scale(1.03);
+    background: rgba(255,255,255,0.08);
+    box-shadow: 0 0 25px rgba(0,255,200,0.2);
+}
+/* ICON */
+.icon {
+    width: 36px;
+    height: 36px;
+    margin-bottom: 10px;
+    color: #94a3b8;
+}
+.input-card:hover .icon {
+    color: #00ffc8;
+}
+/* BUTTON */
+.stButton>button {
+    border-radius: 12px;
+    height: 50px;
+    font-weight: 600;
+    background: linear-gradient(90deg, #00ffc8, #00c3ff);
+    color: black;
+    border: none;
+}
+/* TEXT AREA */
+textarea {
+    background: rgba(255,255,255,0.05) !important;
+    color: white !important;
+    border-radius: 12px !important;
+}
+/* METRICS */
+[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.04);
+    padding: 15px;
+    border-radius: 12px;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+
+
+# ---------- HEADER ----------
+st.markdown("""
+<div class="title">PII Masking Studio</div>
+<div class="subtitle">Real-time AI data anonymization engine</div>
+""", unsafe_allow_html=True)
+
+
+
+# ---------- MODEL LOAD ----------
+pipes = load_ner_pipelines()
+
+# ---------- INPUT MODE ----------
+st.markdown("### Select Input Type")
+
+if "input_mode" not in st.session_state:
+    st.session_state.input_mode = "text"
+
+col1, col2, col3 = st.columns(3)
+
+# --- TEXT ---
+with col1:
+    st.markdown("""
+    <div class="input-card">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path d="M4 7h16M4 12h16M4 17h10"/>
+        </svg>
+        <b>Text</b>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.button("Select Text", use_container_width=True):
+        st.session_state.input_mode = "text"
+
+# --- DOCUMENT ---
+with col2:
+    st.markdown("""
+    <div class="input-card">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path d="M6 2h9l5 5v15H6z"/>
+        </svg>
+        <b>Document</b>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.button("Select Document", use_container_width=True):
+        st.session_state.input_mode = "file"
+
+# --- IMAGE ---
+with col3:
+    st.markdown("""
+    <div class="input-card">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <rect x="3" y="3" width="18" height="18"/>
+            <circle cx="8" cy="8" r="2"/>
+        </svg>
+        <b>Image</b>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.button("Select Image", use_container_width=True):
+        st.session_state.input_mode = "image"
+
+mode = st.session_state.input_mode
+
+st.markdown("---")
+
+input_text = ""
+file_type = None
+
+# ---------- INPUT AREA ----------
+if mode == "text":
+    input_text = st.text_area("", height=200, placeholder="Enter your text...")
+
+elif mode == "file":
+    uploaded_file = st.file_uploader("", type=["pdf", "docx"])
+    if uploaded_file:
+        file_bytes = uploaded_file.read()
+        if uploaded_file.name.endswith(".pdf"):
+            input_text = read_pdf(file_bytes)
         else:
-            st.error("Desteklenmeyen dosya türü.")
-            raw_text = ""
-    except Exception as e:
-        st.error(f"Dosya okunamadı: {e}")
-        raw_text = ""
+            input_text = read_docx(file_bytes)
 
-    if raw_text:
-        st.subheader("📋 Orijinal Metin")
-        st.text_area("Original Text", raw_text, height=300)
+elif mode == "image":
+    uploaded_image = st.file_uploader("", type=["png", "jpg", "jpeg"])
+    if uploaded_image:
+        st.image(uploaded_image, use_column_width=True)
+        with st.spinner("Running OCR..."):
+            input_text = read_image(uploaded_image.read())
 
-        with st.spinner("Metin analiz ediliyor..."):
-            summary, masked_text = analyze_text(raw_text, lang_option)
+st.markdown("---")
 
-        st.subheader("🔒 Maskelenmiş Metin")
-        st.text_area("Masked Text", masked_text, height=300)
+# ---------- RUN ----------
+run = st.button("🚀 Analyze & Mask Data", use_container_width=True)
 
-        st.subheader("📝 Summary Table")
-        st.text_area("Summary Table", summary, height=300)
+# ---------- RESULTS ----------
+if run:
+    if not input_text.strip():
+        st.warning("Please provide input.")
+    else:
+        with st.spinner("Analyzing..."):
+            entities, masked_text, mapping = analyze_text(input_text, lang, pipes)
 
-        pdf_path = export_masked_pdf(masked_text)
-        docx_path = export_masked_docx(masked_text)
+        st.markdown("### 📊 Results")
 
-        st.download_button(
-            label="📥 Masked PDF İndir",
-            data=open(pdf_path, "rb").read(),
-            file_name="masked_output.pdf",
-            mime="application/pdf"
-        )
+        masked_count = sum(1 for e in entities if e.action == "MASK")
+        passed_count = sum(1 for e in entities if e.action == "PASS")
 
-        st.download_button(
-            label="📥 Masked DOCX İndir",
-            data=open(docx_path, "rb").read(),
-            file_name="masked_output.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Entities", len(entities))
+        col2.metric("Masked", masked_count)
+        col3.metric("Passed", passed_count)
+
+        st.markdown("---")
+
+        left, right = st.columns([1.3, 1])
+
+        with left:
+            st.text_area("Masked Output", value=masked_text, height=300)
+
+        with right:
+            import pandas as pd
+            df = pd.DataFrame([{
+                "Type": e.type,
+                "Value": e.value,
+                "Action": e.action,
+                "Level": e.level
+            } for e in entities])
+            st.dataframe(df, use_container_width=True)
+
+        
+        st.markdown("<div style='margin-top:-20px'></div>", unsafe_allow_html=True)
+        c1, c2 = st.columns([1, 1])
+
+        with c1:
+            st.download_button(
+                "Download PDF",
+                export_masked_pdf(masked_text),
+                file_name="masked.pdf",
+                use_container_width=True
+            )
+
+        with c2:
+            st.download_button(
+                "Download DOCX",
+                export_masked_docx(masked_text),
+                file_name="masked.docx",
+                use_container_width=True
+            )
