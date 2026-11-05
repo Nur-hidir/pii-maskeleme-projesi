@@ -10,6 +10,4 @@
    opencv-python-headless
    numpy
    pandas
-  tesseract-ocr
-  tesseract-ocr-tur
-  fonts-dejavu-core
+ 
