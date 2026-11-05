@@ -1,7 +1,12 @@
-streamlit
-wikipedia-api
-transformers
-pdfplumber
-python-docx
-reportlab
-tf-keras
+   streamlit
+   transformers
+   torch
+   wikipedia-api
+   pdfplumber
+   python-docx
+   reportlab
+   pillow
+   pytesseract
+   opencv-python-headless
+   numpy
+   pandas
